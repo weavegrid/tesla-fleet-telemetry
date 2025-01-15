@@ -21,6 +21,7 @@ import (
 	"github.com/teslamotors/fleet-telemetry/datastore/googlepubsub"
 	"github.com/teslamotors/fleet-telemetry/datastore/kafka"
 	"github.com/teslamotors/fleet-telemetry/datastore/kinesis"
+	"github.com/teslamotors/fleet-telemetry/datastore/mqtt"
 	"github.com/teslamotors/fleet-telemetry/datastore/simple"
 	"github.com/teslamotors/fleet-telemetry/datastore/zmq"
 	logrus "github.com/teslamotors/fleet-telemetry/logger"
@@ -99,6 +100,9 @@ type Config struct {
 
 	// Airbrake config
 	Airbrake *Airbrake
+
+	// MQTT config
+	MQTT *mqtt.Config `json:"mqtt,omitempty"`
 }
 
 // Airbrake config
@@ -249,7 +253,8 @@ func (c *Config) prometheusEnabled() bool {
 }
 
 // ConfigureProducers validates and establishes connections to the producers (kafka/pubsub/logger)
-func (c *Config) ConfigureProducers(airbrakeHandler *airbrake.Handler, logger *logrus.Logger) (map[telemetry.Dispatcher]telemetry.Producer, map[string][]telemetry.Producer, error) {
+func (c *Config) ConfigureProducers(airbrakeHandler *airbrake.Handler, logger *logrus.Logger, test bool) (map[telemetry.Dispatcher]telemetry.Producer, map[string][]telemetry.Producer, error) {
+	var pubsubTxTypes []string
 	reliableAckSources, err := c.configureReliableAckSources()
 	if err != nil {
 		return nil, nil, err
@@ -315,16 +320,36 @@ func (c *Config) ConfigureProducers(airbrakeHandler *airbrake.Handler, logger *l
 		producers[telemetry.ZMQ] = zmqProducer
 	}
 
+	if _, ok := requiredDispatchers[telemetry.MQTT]; ok {
+		if c.MQTT == nil {
+			return nil, nil, errors.New("Expected MQTT to be configured")
+		}
+		mqttProducer, err := mqtt.NewProducer(context.Background(), c.MQTT, c.MetricCollector, c.Namespace, airbrakeHandler, c.AckChan, reliableAckSources[telemetry.MQTT], logger)
+		if err != nil {
+			return nil, nil, err
+		}
+		producers[telemetry.MQTT] = mqttProducer
+	}
+
 	dispatchProducerRules := make(map[string][]telemetry.Producer)
 	for recordName, dispatchRules := range c.Records {
 		var dispatchFuncs []telemetry.Producer
 		for _, dispatchRule := range dispatchRules {
+			if dispatchRule == telemetry.Pubsub {
+				pubsubTxTypes = append(pubsubTxTypes, recordName)
+			}
 			dispatchFuncs = append(dispatchFuncs, producers[dispatchRule])
 		}
 		dispatchProducerRules[recordName] = dispatchFuncs
 
 		if len(dispatchProducerRules[recordName]) == 0 {
 			return nil, nil, fmt.Errorf("unknown_dispatch_rule record: %v, dispatchRule:%v", recordName, dispatchRules)
+		}
+	}
+
+	if !test && len(pubsubTxTypes) > 0 {
+		if err := producers[telemetry.Pubsub].(*googlepubsub.Producer).ProvisionTopics(pubsubTxTypes); err != nil {
+			return nil, nil, err
 		}
 	}
 
